@@ -1,8 +1,10 @@
 /**
  * `FirecrawlSearchProvider`: a `WebSearchProvider` backed by the Firecrawl search API
- * (`POST /v1/search`). It maps `title` to `title` and the `description` excerpt (bounded by
- * `maxSnippetChars`) to `snippet`, keeps citeable URL-only entries when no description is
- * present, and omits `content` because Firecrawl returns no generated answer.
+ * (`POST /v1/search`, with a `POST /v2/search` fallback for self-hosted
+ * instances that only serve v2). It maps `title` to `title` and the
+ * `description` excerpt (bounded by `maxSnippetChars`) to `snippet`, keeps
+ * citeable URL-only entries when no description is present, and omits
+ * `content` because Firecrawl returns no generated answer.
  * @module @elves-ai/dsh-web-search-firecrawl/provider
  */
 
@@ -32,9 +34,18 @@ const USER_AGENT = 'dsh-web-search-firecrawl/0.1.1'
 
 /** Resolved provider options (the plugin's `apply` supplies env-var and constant defaults). */
 export interface FirecrawlSearchProviderOptions {
-  /** Firecrawl API key. Empty/absent makes the provider unavailable. */
+  /**
+   * Firecrawl API key. Empty/absent is allowed: self-hosted instances running
+   * with `USE_DB_AUTHENTICATION=false` accept keyless requests. The cloud API
+   * still needs a key, so `available()` stays false without one unless the
+   * base URL points at a loopback host.
+   */
   apiKey: string
-  /** Endpoint base; `/v1/search` is appended. */
+  /**
+   * Endpoint base. `/v1/search` is tried first; a self-hosted instance that
+   * answers 404 there is retried at `/v2/search` (whose `data.web[]` is also
+   * accepted).
+   */
   baseURL: string
   /** Default result count when a request carries no `maxResults`. */
   limit?: number
@@ -75,9 +86,10 @@ export function mapFirecrawlResult(item: FirecrawlSearchDataItem, maxSnippetChar
 }
 
 /**
- * Map a Firecrawl response envelope to a normalized search result.
+ * Map a Firecrawl response envelope to a normalized search result. Accepts
+ * both the v1 flat `data[]` and the v2 `data.web[]` shape.
  *
- * @param response - the parsed `POST /v1/search` response body.
+ * @param response - the parsed search response body.
  * @param maxSnippetChars - bound on one mapped snippet length.
  * @returns the normalized result.
  * @throws {@link WebError} `WEB_PROVIDER_ERROR` when the envelope reports failure.
@@ -90,7 +102,16 @@ export function mapFirecrawlResponse(response: FirecrawlSearchResponse, maxSnipp
       'WEB_PROVIDER_ERROR',
     )
   }
-  const sources = (response.data ?? [])
+  const data = response.data
+  // Absent data = empty result (tolerated); a present-but-misshapen data is a
+  // provider error rather than a silent empty.
+  const items = data === undefined
+    ? []
+    : Array.isArray(data) ? data : (data != null && Array.isArray(data.web) ? data.web : undefined)
+  if (items === undefined) {
+    throw new WebError('Firecrawl returned an unprocessable response body: unexpected data shape', 'WEB_PROVIDER_ERROR')
+  }
+  const sources = items
     .map(item => mapFirecrawlResult(item, maxSnippetChars))
   // Firecrawl returns no generated answer, so `content` is omitted. The web service owns the
   // final `maxResults` truncation, so this provider reports `truncated: false`.
@@ -112,7 +133,10 @@ export class FirecrawlSearchProvider implements WebSearchProvider {
 
   available(): boolean {
     const options = this.resolveOptions()
-    return options.apiKey.length > 0
+    // Keyless loopback instances (self-hosted, USE_DB_AUTHENTICATION=false)
+    // are usable without a key; anywhere else still requires one.
+    const hasKey = options.apiKey.length > 0 || isLoopbackBaseUrl(options.baseURL)
+    return hasKey
       && isValidBaseUrl(options.baseURL)
       && isPositiveInteger(options.maxSnippetChars)
       && (options.limit === undefined || isPositiveInteger(options.limit))
@@ -122,26 +146,15 @@ export class FirecrawlSearchProvider implements WebSearchProvider {
     const options = this.resolveOptions()
     // A per-request bound wins over the configured default; either may be absent.
     const limit = request.maxResults ?? options.limit
-    let response: Response
-    try {
-      response = await fetch(`${options.baseURL}/v1/search`, {
-        method: 'POST',
-        redirect: 'error',
-        headers: {
-          'authorization': `Bearer ${options.apiKey}`,
-          'content-type': 'application/json',
-          'accept': 'application/json',
-          'user-agent': USER_AGENT,
-        },
-        body: JSON.stringify({
-          query: request.query,
-          ...limit !== undefined ? { limit } : {},
-        }),
-        ...signal !== undefined ? { signal } : {},
-      })
-    } catch (error: unknown) {
-      if (isAbortError(error)) throw new WebError('Firecrawl search aborted', 'WEB_ABORTED', { cause: error })
-      throw new WebError(`Firecrawl search request failed: ${String(error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
+    const body = JSON.stringify({
+      query: request.query,
+      ...limit !== undefined ? { limit } : {},
+    })
+    // v1 first (cloud + self-hosted both serve it today); a 404 falls through
+    // to v2 for self-hosted instances that only serve the new route.
+    let response = await this.postSearch(options, '/v1/search', body, signal)
+    if (response.status === 404) {
+      response = await this.postSearch(options, '/v2/search', body, signal)
     }
 
     if (!response.ok) {
@@ -172,12 +185,58 @@ export class FirecrawlSearchProvider implements WebSearchProvider {
       throw new WebError(`Firecrawl returned an unprocessable response body: ${String(error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
     }
   }
+
+  /**
+   * POST one search operation. A keyless loopback instance sends no auth
+   * header at all (self-hosted, `USE_DB_AUTHENTICATION=false`).
+   */
+  private async postSearch(
+    options: FirecrawlSearchProviderOptions,
+    path: '/v1/search' | '/v2/search',
+    body: string,
+    signal?: AbortSignal,
+  ): Promise<Response> {
+    try {
+      return await fetch(`${options.baseURL}${path}`, {
+        method: 'POST',
+        redirect: 'error',
+        headers: {
+          ...options.apiKey.length > 0 ? { 'authorization': `Bearer ${options.apiKey}` } : {},
+          'content-type': 'application/json',
+          'accept': 'application/json',
+          'user-agent': USER_AGENT,
+        },
+        body,
+        ...signal !== undefined ? { signal } : {},
+      })
+    } catch (error: unknown) {
+      if (isAbortError(error)) throw new WebError('Firecrawl search aborted', 'WEB_ABORTED', { cause: error })
+      throw new WebError(`Firecrawl search request failed: ${String(error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
+    }
+  }
 }
 
 /* jscpd:ignore-start */
 /** True when `baseURL` parses as an absolute URL (a cheap local config check). */
 function isValidBaseUrl(baseURL: string): boolean {
   return URL.canParse(baseURL)
+}
+
+/** True when `baseURL` points at a loopback host (self-hosted, keyless use allowed). */
+function isLoopbackBaseUrl(baseURL: string): boolean {
+  let hostname = ''
+  try {
+    hostname = new URL(baseURL).hostname.toLowerCase()
+  } catch {
+    return false
+  }
+  if (hostname === 'localhost') return true
+  if (hostname.startsWith('[') && hostname.endsWith(']')) hostname = hostname.slice(1, -1)
+  if (hostname === '::1') return true
+  const parts = hostname.split('.')
+  return parts.length === 4
+    && parts[0] === '127'
+    && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)
 }
 
 /** True for a request limit that can be sent to Firecrawl (a positive whole number). */

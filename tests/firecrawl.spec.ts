@@ -70,6 +70,17 @@ describe('Firecrawl result mapping', () => {
     expect(result.content).toBeUndefined()
   })
 
+  it('maps a v2 data.web[] response', () => {
+    const result = mapFirecrawlResponse({
+      success: true,
+      data: { web: [{ url: 'https://a.test', description: 'one' }] },
+    }, 600)
+    expect(result).toEqual({
+      sources: [{ url: 'https://a.test', snippet: 'one' }],
+      truncated: false,
+    })
+  })
+
   it('tolerates a missing data array', () => {
     expect(mapFirecrawlResponse({ success: true }, 600).sources).toEqual([])
   })
@@ -85,8 +96,13 @@ describe('Firecrawl result mapping', () => {
 })
 
 describe('FirecrawlSearchProvider availability', () => {
-  it('is unavailable without a key', () => {
+  it('is unavailable without a key on a remote endpoint', () => {
     expect(providerOf({ apiKey: '' }).available()).toBe(false)
+  })
+
+  it('is available keyless on a loopback self-hosted endpoint', () => {
+    expect(providerOf({ apiKey: '', baseURL: 'http://localhost:3002' }).available()).toBe(true)
+    expect(providerOf({ apiKey: '', baseURL: 'http://127.0.0.1:3002' }).available()).toBe(true)
   })
 
   it('is available with a key', () => {
@@ -154,6 +170,30 @@ describe('FirecrawlSearchProvider request mapping', () => {
     await providerOf().search({ query: 'q' }, controller.signal)
     const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
     expect(init.signal).toBe(controller.signal)
+  })
+  it('retries /v2/search when /v1/search answers 404 (self-hosted)', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/v1/search')) return new Response('not found', { status: 404 })
+      return jsonResponse({ success: true, data: { web: [{ url: 'https://a.test', description: 'v2 excerpt' }] } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await providerOf({ apiKey: '', baseURL: 'http://localhost:3002' }).search({ query: 'q' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const [secondUrl, secondInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit]
+    expect(secondUrl).toBe('http://localhost:3002/v2/search')
+    expect(secondInit.headers).not.toHaveProperty('authorization')
+    expect(result).toEqual({
+      sources: [{ url: 'https://a.test', snippet: 'v2 excerpt' }],
+      truncated: false,
+    })
+  })
+
+  it('omits the auth header for keyless loopback requests', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ success: true, data: [] }))
+    vi.stubGlobal('fetch', fetchMock)
+    await providerOf({ apiKey: '', baseURL: 'http://localhost:3002' }).search({ query: 'q' })
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(init.headers).not.toHaveProperty('authorization')
   })
 })
 
@@ -311,7 +351,7 @@ describe('web-search-firecrawl plugin registration', () => {
     }
   })
 
-  it('is unavailable when neither config nor env supplies a key', async () => {
+  it('is unavailable keyless on a non-loopback endpoint', async () => {
     const prev = process.env.FIRECRAWL_API_KEY
     delete process.env.FIRECRAWL_API_KEY
     try {
@@ -322,6 +362,25 @@ describe('web-search-firecrawl plugin registration', () => {
         .rejects.toThrow(expect.objectContaining({ code: 'WEB_PROVIDER_CONFIGURED_UNAVAILABLE' }))
     } finally {
       if (prev !== undefined) process.env.FIRECRAWL_API_KEY = prev
+    }
+  })
+
+  it('is available keyless when the base URL is loopback', async () => {
+    const prevKey = process.env.FIRECRAWL_API_KEY
+    delete process.env.FIRECRAWL_API_KEY
+    try {
+      const fetchMock = vi.fn(async () => jsonResponse({ success: true, data: [] }))
+      vi.stubGlobal('fetch', fetchMock)
+      const ctx = new Context()
+      await ctx.plugin(WebRuntime, { searchProvider: FIRECRAWL_PROVIDER_ID })
+      const fiber = await ctx.plugin(firecrawlPlugin, { baseURL: 'http://localhost:3002' })
+      await expect(ctx.web.search({ query: 'q' })).resolves.toMatchObject({ sources: [], truncated: false })
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+      expect(url).toBe('http://localhost:3002/v1/search')
+      expect(init.headers).not.toHaveProperty('authorization')
+      await fiber.dispose()
+    } finally {
+      if (prevKey !== undefined) process.env.FIRECRAWL_API_KEY = prevKey
     }
   })
 })
