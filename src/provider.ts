@@ -40,10 +40,6 @@ export interface FirecrawlSearchProviderOptions {
   limit?: number
   /** Upper bound on characters kept from one `description` when mapping `snippet`. */
   maxSnippetChars: number
-  /** Route searches through Firecrawl; false delegates to {@link fallback}. */
-  useFirecrawl?: boolean
-  /** Original web-search provider used when `useFirecrawl` is false. */
-  fallback?: WebSearchProvider
 }
 
 /**
@@ -105,23 +101,17 @@ export function mapFirecrawlResponse(response: FirecrawlSearchResponse, maxSnipp
 export class FirecrawlSearchProvider implements WebSearchProvider {
   readonly id = FIRECRAWL_PROVIDER_ID
 
-  constructor(private options: FirecrawlSearchProviderOptions) {}
-
   /**
-   * Replace the options used by the next `available()` / `search()` call.
-   * The plugin host calls this when a settings-page commit resolves, so a
-   * key or endpoint change reaches the already-registered provider without a
-   * re-registration or a restart.
+   * @param resolveOptions - the options for the NEXT operation, snapshotted
+   * once at each operation's entry so one search never mixes two sections. A
+   * thunk rather than a value because the plugin's volatile config can change
+   * between searches, and re-registering the provider to carry a new endpoint
+   * would make the seam's selection observable to the user as a flicker.
    */
-  setOptions(options: FirecrawlSearchProviderOptions): void {
-    this.options = options
-  }
+  constructor(private readonly resolveOptions: () => FirecrawlSearchProviderOptions) {}
 
   available(): boolean {
-    const options = this.options
-    if (options.useFirecrawl === false) {
-      return options.fallback?.available() ?? false
-    }
+    const options = this.resolveOptions()
     return options.apiKey.length > 0
       && isValidBaseUrl(options.baseURL)
       && isPositiveInteger(options.maxSnippetChars)
@@ -129,14 +119,7 @@ export class FirecrawlSearchProvider implements WebSearchProvider {
   }
 
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
-    const options = this.options
-    if (options.useFirecrawl === false) {
-      const fallback = options.fallback
-      if (fallback === undefined) {
-        throw new WebError('Firecrawl search is disabled and no fallback web-search provider is configured', 'WEB_PROVIDER_CONFIGURED_UNAVAILABLE')
-      }
-      return fallback.search(request, signal)
-    }
+    const options = this.resolveOptions()
     // A per-request bound wins over the configured default; either may be absent.
     const limit = request.maxResults ?? options.limit
     let response: Response
