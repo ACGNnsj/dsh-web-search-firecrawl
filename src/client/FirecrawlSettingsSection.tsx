@@ -1,35 +1,32 @@
 /**
  * The "Firecrawl" settings page contributed to the DSH Settings shell.
  *
- * 0.2.0-rc.2 port: reads and writes through the shared `configForms` service
- * addressed by this plugin's profile entry id. The API key is write-only in
- * the wire direction: the host schema marks it `role('secret')`, so this page
- * never receives the literal — it shows whether a key is configured (from the
- * shared describe mirror), accepts a replacement (blank = keep the current
- * key), and offers an explicit clear button. All commits apply live: the host
- * provider snapshots the volatile refs on the next search.
+ * 0.2.0-rc.2 port: the form is resolved in `apply` and handed in through the
+ * slot inject face (`useSettings` selector hook + `mutateSettings`), the same
+ * pattern as the approved `dsh-web-search-enhanced` plugin. The API key is
+ * write-only in the wire direction: the host schema marks it `role('secret')`,
+ * so this page never receives the literal — it shows whether a key is
+ * configured, accepts a replacement (blank = keep the current key), and
+ * offers an explicit clear button. All commits apply live.
  */
 
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 import { Button, Input } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
-import type { SettingsNamespaceView } from '@deepseek-ai/dsh-settings/types'
 // Type-only: pulls the settings shell's SlotMap merge for 'settings.section'.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
-import type { Context } from '@deepseek-ai/cordis'
+import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import {
   FIRECRAWL_DEFAULT_BASE_URL,
   FIRECRAWL_DEFAULT_MAX_SNIPPET_CHARS,
 } from '../settings-shared.ts'
+import type { FirecrawlSettingsOp } from './api.ts'
 import css from './FirecrawlSettingsSection.module.css'
 
-/** Props the settings shell binds for this section. */
+/** Props the settings shell binds for this section (plus the inject face). */
 export type FirecrawlSettingsSectionProps = PropsRuntime<'settings.section'> & {
-  /** Host plugin entry id owning this form (the profile row id). */
-  entryId?: string
-  /** Browser plugin context carrying `configForms`. */
-  ctx?: Context
+  /** Shared entry form handed in by `apply` through the slot inject face. */
+  form?: ConfigForm<Record<string, unknown>>
 }
 
 /** Local drafts for the three settings controls. */
@@ -47,15 +44,8 @@ const INITIAL_DRAFTS: Drafts = {
   maxSnippetChars: String(FIRECRAWL_DEFAULT_MAX_SNIPPET_CHARS),
 }
 
-type SectionValue = Record<string, unknown>
-
-interface FormsFace {
-  get<T>(entryId: string): ConfigForm<T>
-  describe(): { namespace(ns: string): SettingsNamespaceView | undefined }
-}
-
 /** Read the redacted resolved value into editable draft strings. */
-function draftsOf(value: SectionValue | undefined): Drafts {
+function draftsOf(value: Record<string, unknown> | undefined): Drafts {
   const section = value ?? {}
   return {
     apiKey: '',
@@ -105,69 +95,78 @@ function messageOf(error: unknown): string {
   return message
 }
 
-/** Subscribe to one entry form's snapshot. */
-function useFormSnapshot(
-  forms: FormsFace | undefined,
-  entryId: string | undefined,
-): ConfigFormSnapshot<SectionValue> | undefined {
-  const form = entryId !== undefined && forms !== undefined ? forms.get<SectionValue>(entryId) : undefined
-  const subscribe = useCallback((notify: () => void) => {
-    if (form === undefined) return () => {}
-    return form.subscribe(notify)
-  }, [form])
-  const snapshot = useCallback(() => form?.getSnapshot() as ConfigFormSnapshot<SectionValue> | undefined, [form])
-  return useSyncExternalStore(subscribe, snapshot)
-}
-
 /**
  * Render the Firecrawl settings page.
- * @param props - the runtime share of a `settings.section` entry.
+ * @param props - the runtime share of a `settings.section` entry plus the form face.
  * @returns the section element tree.
  */
 export function FirecrawlSettingsSection(props: FirecrawlSettingsSectionProps) {
-  const entryId = props.entryId ?? 'web-search-firecrawl'
-  const forms = (props.ctx as unknown as { configForms?: FormsFace } | undefined)?.configForms
-  const snapshot = useFormSnapshot(forms, entryId)
+  const form = props.form
+
+  // Without the injected form the page cannot read — render the error instead
+  // of stalling on "loading".
+  if (form === undefined) {
+    return (
+      <div className={css.section}>
+        <p className={css.intro}>Firecrawl 搜索提供方的 API 密钥与请求参数。</p>
+        <p className={css.error} role="alert">设置表单未就绪。请重启 DSH 后重试。</p>
+      </div>
+    )
+  }
+
+  return <FirecrawlForm form={form} />
+}
+
+function FirecrawlForm({ form }: {
+  form: ConfigForm<Record<string, unknown>>
+}) {
+  // Subscribe to the shared form snapshot; re-renders on every Host commit.
+  const snapshot = useSyncExternalStore(
+    (notify: () => void) => form.subscribe(notify),
+    () => form.getSnapshot(),
+  )
   const [drafts, setDrafts] = useState<Drafts>(INITIAL_DRAFTS)
-  const [draftKey, setDraftKey] = useState(0)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [showApiKey, setShowApiKey] = useState(false)
+  const value = snapshot?.value
+  const revision = snapshot?.revision
+  const writable = snapshot?.writable ?? true
+  const status = snapshot?.status ?? 'loading'
 
   // Adopt the Host value into drafts whenever a fresh snapshot lands (but
-  // never clobber the write-only key draft except after our own save).
+  // never clobber the write-only key draft).
   useEffect(() => {
-    if (snapshot?.value !== undefined) {
-      setDrafts(current => ({ ...draftsOf(snapshot.value), apiKey: draftKey === 0 ? '' : current.apiKey }))
+    if (value !== undefined) {
+      setDrafts({ ...draftsOf(value) })
     }
-  }, [snapshot?.value, snapshot?.revision, draftKey])
+    // Adopt on value identity change only; drafts are user-owned otherwise.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value])
 
-  const form = entryId !== undefined && forms !== undefined ? forms.get<SectionValue>(entryId) : undefined
-  const status = snapshot?.status ?? 'loading'
-  const configured = (() => {
-    try {
-      const row = forms?.describe().namespace(entryId)
-      return (row?.secrets ?? []).some(secret => secret.path.length === 1 && secret.path[0] === 'apiKey' && secret.set)
-    } catch {
-      return false
-    }
-  })()
-  const disabled = form === undefined || snapshot?.writable === false || saving || status !== 'ready'
+  // Secret presence: the wire value never carries the literal, so "configured"
+  // is approximated by a non-empty user-layer apiKey OR the shared secret
+  // marker. The form value redacts secrets, so track it via local knowledge:
+  // after a successful set/unset we know the outcome; before that, presence of
+  // any other saved field implies nothing — default to unknown=false and let
+  // the placeholder guide. (The Host `available()` is the source of truth.)
+  const configured = value !== undefined && typeof (value as Record<string, unknown>).apiKey === 'string'
+    && ((value as Record<string, unknown>).apiKey as string).length > 0
+  const disabled = writable === false || saving || status !== 'ready'
 
-  const applyOps = async (ops: Array<{ op: 'set'; path: [string]; value: unknown } | { op: 'unset'; path: [string] }>): Promise<void> => {
-    if (form === undefined || snapshot?.writable === false) return
+  const applyOps = async (ops: FirecrawlSettingsOp[]): Promise<void> => {
+    if (writable === false) return
     setSaving(true)
     setError(null)
     setNotice(null)
     try {
-      const ok = await form.mutate(ops, snapshot?.revision)
+      const ok = await form.mutate(ops, revision)
       if (!ok) {
         setError('保存被拒绝，已重新载入；请再次保存。')
         return
       }
-      setDrafts(current => ({ ...current, apiKey: '' }))
-      setDraftKey(key => key + 1)
+      setDrafts({ ...drafts, apiKey: '' })
       setNotice('已保存，新配置立即用于下一次搜索。')
     } catch (caught) {
       setError(messageOf(caught))
@@ -190,7 +189,7 @@ export function FirecrawlSettingsSection(props: FirecrawlSettingsSectionProps) {
       setError('maxSnippetChars 必须是正整数。')
       return
     }
-    const ops: Array<{ op: 'set'; path: [string]; value: unknown } | { op: 'unset'; path: [string] }> = []
+    const ops: FirecrawlSettingsOp[] = []
     const apiKey = drafts.apiKey.trim()
     if (apiKey !== '') ops.push({ op: 'set', path: ['apiKey'], value: apiKey })
     if (baseURL !== '') ops.push({ op: 'set', path: ['baseURL'], value: baseURL })
@@ -207,10 +206,10 @@ export function FirecrawlSettingsSection(props: FirecrawlSettingsSectionProps) {
     void applyOps([{ op: 'unset', path: ['apiKey'] }])
   }
 
-  if (status === 'loading' || snapshot === undefined) {
+  if (status === 'loading') {
     return <div className={css.section}><p className={css.hint}>正在加载 Firecrawl 配置…</p></div>
   }
-  if (status === 'unavailable' || form === undefined) {
+  if (status === 'unavailable') {
     return (
       <div className={css.section}>
         <p className={css.intro}>Firecrawl 搜索提供方的 API 密钥与请求参数。</p>
@@ -227,7 +226,7 @@ export function FirecrawlSettingsSection(props: FirecrawlSettingsSectionProps) {
         <div className={css.row}>
           <div className={css.rowText}>
             <label className={css.title} htmlFor="firecrawl-api-key">API Key</label>
-            <span className={css.desc}>写入设置文档的密钥不会回显；留空保存表示保持当前值，未配置时回退 $FIRECRAWL_API_KEY。</span>
+            <span className={css.desc}>写入设置文档的密钥不会回显；留空保存表示保持当前值，未配置时回退 $FIRECRAWL_API_KEY，本地自托管可留空。</span>
           </div>
           <div className={css.control}>
             <Input
@@ -235,7 +234,7 @@ export function FirecrawlSettingsSection(props: FirecrawlSettingsSectionProps) {
               type={showApiKey ? 'text' : 'password'}
               autoComplete="off"
               value={drafts.apiKey}
-              placeholder={configured ? '已配置（留空保持不变）' : 'fc-...'}
+              placeholder={configured ? '已配置（留空保持不变）' : 'fc-...（本地可留空）'}
               disabled={disabled}
               onChange={event => { setDrafts({ ...drafts, apiKey: event.currentTarget.value }) }}
             />
@@ -262,7 +261,7 @@ export function FirecrawlSettingsSection(props: FirecrawlSettingsSectionProps) {
         <div className={css.row}>
           <div className={css.rowText}>
             <label className={css.title} htmlFor="firecrawl-base-url">Base URL</label>
-            <span className={css.desc}>端点基址，搜索时追加 /v1/search。留空可指向本地自托管（http://localhost:3002）。</span>
+            <span className={css.desc}>端点基址，搜索时追加 /v1/search（404 自动试 /v2/search）。本地自托管填 http://localhost:3002。</span>
           </div>
           <div className={css.control}>
             <Input
