@@ -9,7 +9,7 @@
  * entry's namespace so a composition without the plugin shows no trace.
  */
 
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import { FirecrawlSettingsSection } from './FirecrawlSettingsSection.tsx'
 
@@ -20,12 +20,13 @@ export const inject = ['slots', 'configForms']
  * Register the Firecrawl settings section.
  * @param ctx - the browser plugin context.
  */
-export function apply(ctx: ClientContext): void {
-  const forms = (ctx as unknown as {
-    configForms: {
-      whileServed: (namespaces: readonly string[], register: () => () => void) => () => void
-    }
-  }).configForms
+export function apply(ctx: Context & {
+  slots: { register(options: object, component: unknown): () => void }
+  configForms: {
+    whileServed: (namespaces: readonly string[], register: () => () => void) => () => void
+  }
+}): void {
+  const forms = ctx.configForms
   // The Host serves the entry under its namespace; `web-search-firecrawl` is
   // both the plugin short name and the served namespace key. The entry id for
   // `configForms.get` is resolved by the section itself from its slot owner.

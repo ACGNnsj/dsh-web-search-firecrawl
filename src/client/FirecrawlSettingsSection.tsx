@@ -16,7 +16,7 @@ import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-
 import type { SettingsNamespaceView } from '@deepseek-ai/dsh-settings/types'
 // Type-only: pulls the settings shell's SlotMap merge for 'settings.section'.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context } from '@deepseek-ai/cordis'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import {
   FIRECRAWL_DEFAULT_BASE_URL,
@@ -29,7 +29,7 @@ export type FirecrawlSettingsSectionProps = PropsRuntime<'settings.section'> & {
   /** Host plugin entry id owning this form (the profile row id). */
   entryId?: string
   /** Browser plugin context carrying `configForms`. */
-  ctx?: ClientContext
+  ctx?: Context
 }
 
 /** Local drafts for the three settings controls. */
